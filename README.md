@@ -1,5 +1,7 @@
 # PicoCal Transformer: DETR-inspired Calorimeter Reconstruction
 
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zhaomr13/picocal_reco_transformer)
+
 Transformer-based reconstruction algorithm for the LHCb SPACAL calorimeter, inspired by DETR (DEtection TRansformer). This approach treats calorimeter reconstruction as a set prediction problem where clusters are directly predicted from the full set of active cells using transformer attention mechanisms.
 
 ## Overview
