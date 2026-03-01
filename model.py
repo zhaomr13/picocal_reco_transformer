@@ -84,15 +84,47 @@ class PicoCalTransformerModel(nn.Module):
         # Learnable cluster queries (object queries in DETR)
         self.query_embed = nn.Embedding(num_cluster_queries, d_model)
 
+        # Query anchor positions - learnable "home" positions for each query
+        # Initialize spread across the calorimeter (X: -3000 to 3000, Y: -2000 to 2000)
+        self.query_anchors = nn.Parameter(
+            torch.randn(num_cluster_queries, 2) * 1500.0
+        )
+
         # Prediction heads
         self.cluster_head = ClusterPredictionHead(d_model)
 
         self._reset_parameters()
 
+        # Initialize position head to predict small offsets from anchors
+        # This must be done after _reset_parameters to override xavier init
+        self._init_position_head_for_anchors()
+
     def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
+        # Don't apply xavier to query_anchors - keep their random spread
+        for name, p in self.named_parameters():
+            if p.dim() > 1 and 'query_anchors' not in name:
                 nn.init.xavier_uniform_(p)
+
+    def _init_position_head_for_anchors(self):
+        """
+        Initialize position head to predict small offsets from query anchors.
+        This helps queries start near their anchor positions and specialize.
+        """
+        # Get the last layer of position head
+        position_head_last = self.cluster_head.position_head[-1]
+
+        # Initialize weights to near zero (small offsets)
+        position_head_last.weight.data.fill_(0.0)
+        position_head_last.bias.data.fill_(0.0)
+
+        # Set z bias to calorimeter surface (z ≈ 12620 mm)
+        position_head_last.bias.data[2] = 12620.0
+
+        # Re-initialize query anchors with proper spread (xavier overwrites them)
+        nn.init.normal_(self.query_anchors, mean=0.0, std=1500.0)
+
+        print(f"Initialized position head for anchor-based prediction")
+        print(f"Query anchors initialized with std: {self.query_anchors.data.std():.2f} mm")
 
     def forward(self, cell_features, cell_positions, mask=None):
         """
@@ -150,22 +182,24 @@ class PicoCalTransformerModel(nn.Module):
         else:
             output_embeddings = hs.transpose(0, 1)
 
-        # Apply prediction heads
-        predictions = self.cluster_head(output_embeddings)
+        # Apply prediction heads (with query anchors for position prediction)
+        predictions = self.cluster_head(output_embeddings, self.query_anchors)
 
         return predictions
 
 
 class ClusterPredictionHead(nn.Module):
     """
-    Prediction heads for cluster properties.
+    Prediction heads for cluster properties with query anchors.
 
     For each cluster query, predicts:
     - Existence: Binary classification (cluster exists or not)
     - Energy: Total energy and Front/Back components
-    - Position: (x, y, z) coordinates
+    - Position: Offset from query anchor (delta_x, delta_y, z)
     - Time: Combined and Front/Back timing
     - Confidence: Prediction confidence score
+
+    Query anchors provide "home" positions for each query, preventing collapse.
     """
 
     def __init__(self, d_model=256, hidden_dim=256):
@@ -195,11 +229,12 @@ class ClusterPredictionHead(nn.Module):
             nn.Linear(hidden_dim, 3)  # E_total, E_F, E_B
         )
 
-        # Position head
+        # Position head - predicts OFFSET from anchor, not absolute position
+        # This allows each query to specialize to its "home" region
         self.position_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 3)  # x, y, z
+            nn.Linear(hidden_dim, 3)  # delta_x, delta_y, z
         )
 
         # Time head
@@ -217,10 +252,11 @@ class ClusterPredictionHead(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, features):
+    def forward(self, features, query_anchors=None):
         """
         Args:
             features: [batch_size, num_queries, d_model]
+            query_anchors: [num_queries, 2] learnable anchor positions (x, y)
 
         Returns:
             Dictionary with predictions
@@ -231,12 +267,33 @@ class ClusterPredictionHead(nn.Module):
         # Predictions
         pred_logits = self.existence_head(shared).squeeze(-1)  # [B, num_queries]
         pred_energies = self.energy_head(shared)  # [B, num_queries, 3]
-        pred_positions = self.position_head(shared)  # [B, num_queries, 3]
+        pred_position_offsets = self.position_head(shared)  # [B, num_queries, 3]
         pred_times = self.time_head(shared)  # [B, num_queries, 3]
         pred_confidence = self.confidence_head(shared).squeeze(-1)  # [B, num_queries]
 
         # Apply log-transform to energies (predict log(E + 1) to handle wide dynamic range)
         pred_energies = F.softplus(pred_energies)  # Ensure positive energies
+
+        # Compute final positions: anchor + offset
+        if query_anchors is not None:
+            # query_anchors: [num_queries, 2] -> [1, num_queries, 2]
+            anchors_xy = query_anchors.unsqueeze(0)  # [1, num_queries, 2]
+
+            # Add offset to anchor for x, y; use predicted z directly
+            # pred_position_offsets: [B, num_queries, 3] = (dx, dy, z)
+            pred_positions_x = anchors_xy[..., 0] + pred_position_offsets[..., 0]
+            pred_positions_y = anchors_xy[..., 1] + pred_position_offsets[..., 1]
+            pred_positions_z = pred_position_offsets[..., 2]
+
+            # Stack to get final positions [B, num_queries, 3]
+            pred_positions = torch.stack([
+                pred_positions_x,
+                pred_positions_y,
+                pred_positions_z
+            ], dim=-1)
+        else:
+            # Fallback to direct prediction (for backward compatibility)
+            pred_positions = pred_position_offsets
 
         return {
             'pred_logits': pred_logits,  # [B, num_queries]

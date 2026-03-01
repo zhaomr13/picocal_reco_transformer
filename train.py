@@ -92,7 +92,7 @@ def get_args_parser():
     return parser
 
 
-def train_one_epoch(model, criterion, matcher, data_loader, optimizer, device, epoch, args):
+def train_one_epoch(model, criterion, matcher, data_loader, optimizer, device, epoch, args, log_file=None):
     """Train for one epoch."""
     model.train()
     criterion.train()
@@ -158,11 +158,23 @@ def train_one_epoch(model, criterion, matcher, data_loader, optimizer, device, e
     print(f"Epoch {epoch} - Train Loss: {avg_loss:.4f}, Time: {epoch_time:.2f}s")
     print(f"  Loss breakdown: {', '.join([f'{k}: {v:.4f}' for k, v in loss_dict_total.items()])}")
 
+    # Log to JSON
+    if log_file is not None:
+        log_entry = {
+            'epoch': epoch,
+            'phase': 'train',
+            'loss_total': avg_loss,
+            **{k: float(v) for k, v in loss_dict_total.items()},
+            'time': epoch_time
+        }
+        log_file.write(json.dumps(log_entry) + '\n')
+        log_file.flush()
+
     return avg_loss, loss_dict_total
 
 
 @torch.no_grad()
-def evaluate(model, criterion, matcher, data_loader, device):
+def evaluate(model, criterion, matcher, data_loader, device, epoch=None, log_file=None):
     """Evaluate on validation set."""
     model.eval()
     criterion.eval()
@@ -202,6 +214,17 @@ def evaluate(model, criterion, matcher, data_loader, device):
 
     print(f"Validation Loss: {avg_loss:.4f}")
     print(f"  Loss breakdown: {', '.join([f'{k}: {v:.4f}' for k, v in loss_dict_total.items()])}")
+
+    # Log to JSON
+    if log_file is not None and epoch is not None:
+        log_entry = {
+            'epoch': epoch,
+            'phase': 'val',
+            'loss_total': avg_loss,
+            **{k: float(v) for k, v in loss_dict_total.items()}
+        }
+        log_file.write(json.dumps(log_entry) + '\n')
+        log_file.flush()
 
     return avg_loss, loss_dict_total
 
@@ -327,6 +350,11 @@ def main(args):
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
+    # Open log file
+    log_file_path = output_dir / 'training_log.json'
+    log_file = open(log_file_path, 'w')
+    print(f"Logging to {log_file_path}")
+
     # Training loop
     print()
     print("Starting training...")
@@ -338,7 +366,7 @@ def main(args):
 
         # Train
         train_loss, train_loss_dict = train_one_epoch(
-            model, criterion, matcher, train_loader, optimizer, device, epoch, args
+            model, criterion, matcher, train_loader, optimizer, device, epoch, args, log_file
         )
 
         # Step scheduler
@@ -346,7 +374,7 @@ def main(args):
 
         # Evaluate
         if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
-            val_loss, val_loss_dict = evaluate(model, criterion, matcher, val_loader, device)
+            val_loss, val_loss_dict = evaluate(model, criterion, matcher, val_loader, device, epoch, log_file)
 
             # Save best model
             if val_loss < best_val_loss:
@@ -373,6 +401,9 @@ def main(args):
                 'args': vars(args)
             }
             torch.save(checkpoint, output_dir / f'checkpoint_epoch{epoch + 1}.pth')
+
+    # Close log file
+    log_file.close()
 
     print()
     print("=" * 80)
