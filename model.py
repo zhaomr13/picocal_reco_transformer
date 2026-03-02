@@ -126,7 +126,7 @@ class PicoCalTransformerModel(nn.Module):
         print(f"Initialized position head for anchor-based prediction")
         print(f"Query anchors initialized with std: {self.query_anchors.data.std():.2f} mm")
 
-    def forward(self, cell_features, cell_positions, mask=None, return_auxiliary=False):
+    def forward(self, cell_features, cell_positions, mask=None, return_auxiliary=False, return_attention=False):
         """
         Forward pass.
 
@@ -135,6 +135,7 @@ class PicoCalTransformerModel(nn.Module):
             cell_positions: [batch_size, num_cells, 2] tensor of (x, y) positions
             mask: Optional [batch_size, num_cells] bool tensor (True for padded cells)
             return_auxiliary: If True, return predictions from all decoder layers
+            return_attention: If True, return cross-attention weights for cell assignment loss
 
         Returns:
             Dictionary with:
@@ -144,6 +145,8 @@ class PicoCalTransformerModel(nn.Module):
             - pred_times: [batch_size, num_queries, 3] (t, t_F, t_B) times
             - pred_confidence: [batch_size, num_queries] confidence scores
             - aux_outputs: List of prediction dicts from intermediate layers (if return_auxiliary=True)
+            - attention_weights: [batch_size, num_queries, num_cells] cross-attention weights (if return_attention=True)
+            - cell_positions: [batch_size, num_cells, 2] cell positions (if return_attention=True)
         """
         batch_size, num_cells, _ = cell_features.shape
 
@@ -171,12 +174,37 @@ class PicoCalTransformerModel(nn.Module):
         tgt = torch.zeros_like(query_embed)  # [num_queries, B, d_model]
 
         # Transformer decoder
-        hs = self.decoder(
+        decoder_output = self.decoder(
             tgt, memory,
             memory_key_padding_mask=src_key_padding_mask,
             pos=pos_embed,
-            query_pos=query_embed
-        )  # [num_layers, num_queries, B, d_model] or [1, num_queries, B, d_model]
+            query_pos=query_embed,
+            return_attn_weights=return_attention
+        )
+
+        # Handle decoder output (may include attention weights)
+        if return_attention:
+            hs, attn_weights = decoder_output  # hs: [num_layers, num_queries, B, d_model], attn_weights from multihead_attn
+            # attn_weights shape from multihead_attn is [batch_size * num_heads, num_queries, num_cells]
+            # or [batch_size, num_queries, num_cells] if averaged
+            if attn_weights is not None:
+                num_heads = self.nhead
+                # Check actual shape and handle accordingly
+                if attn_weights.dim() == 3:
+                    # Shape is [batch_size * num_heads, num_queries, num_cells] or [batch_size, num_queries, num_cells]
+                    if attn_weights.shape[0] == batch_size * num_heads:
+                        # Reshape from [B*num_heads, num_queries, N] to [B, num_heads, num_queries, N]
+                        attn_weights = attn_weights.view(batch_size, num_heads, self.num_cluster_queries, num_cells)
+                        # Average over heads
+                        attn_weights = attn_weights.mean(dim=1)  # [B, num_queries, num_cells]
+                    elif attn_weights.shape[0] == batch_size:
+                        # Already averaged over heads: [B, num_queries, num_cells]
+                        pass
+                    else:
+                        # Unknown shape, just use as-is
+                        pass
+        else:
+            hs = decoder_output
 
         # Take decoder outputs
         if self.decoder.return_intermediate:
@@ -198,6 +226,11 @@ class PicoCalTransformerModel(nn.Module):
         # Add auxiliary outputs if requested
         if return_auxiliary and len(all_predictions) > 1:
             predictions['aux_outputs'] = all_predictions[:-1]
+
+        # Add attention weights and cell positions for cell assignment loss
+        if return_attention and attn_weights is not None:
+            predictions['attention_weights'] = attn_weights
+            predictions['cell_positions'] = cell_positions  # [B, num_cells, 2]
 
         return predictions
 
@@ -354,19 +387,39 @@ class TransformerDecoder(nn.Module):
 
     def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
                 tgt_key_padding_mask=None, memory_key_padding_mask=None,
-                pos=None, query_pos=None):
+                pos=None, query_pos=None, return_attn_weights=False):
+        """
+        Args:
+            return_attn_weights: If True, return attention weights from final layer cross-attention
+        Returns:
+            output tensor (stacked if return_intermediate), and optionally attention weights
+        """
         output = tgt
 
         intermediate = []
+        attn_weights = None
 
-        for layer in self.layers:
-            output = layer(
-                output, memory,
-                tgt_mask=tgt_mask, memory_mask=memory_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-                pos=pos, query_pos=query_pos
-            )
+        for i, layer in enumerate(self.layers):
+            # Only return attention weights from final layer
+            layer_return_attn = return_attn_weights and (i == len(self.layers) - 1)
+
+            if layer_return_attn:
+                output, attn_weights = layer(
+                    output, memory,
+                    tgt_mask=tgt_mask, memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    pos=pos, query_pos=query_pos, return_attn_weights=True
+                )
+            else:
+                output = layer(
+                    output, memory,
+                    tgt_mask=tgt_mask, memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    pos=pos, query_pos=query_pos, return_attn_weights=False
+                )
+
             if self.return_intermediate:
                 intermediate.append(self.norm(output) if self.norm else output)
 
@@ -377,9 +430,13 @@ class TransformerDecoder(nn.Module):
                 intermediate.append(output)
 
         if self.return_intermediate:
-            return torch.stack(intermediate)
+            result = torch.stack(intermediate)
+        else:
+            result = output.unsqueeze(0)
 
-        return output.unsqueeze(0)
+        if return_attn_weights:
+            return result, attn_weights
+        return result
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -451,7 +508,13 @@ class TransformerDecoderLayer(nn.Module):
 
     def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
                 tgt_key_padding_mask=None, memory_key_padding_mask=None,
-                pos=None, query_pos=None):
+                pos=None, query_pos=None, return_attn_weights=False):
+        """
+        Args:
+            return_attn_weights: If True, return cross-attention weights
+        Returns:
+            output tensor, and optionally attention weights
+        """
         # Self-attention on queries
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2, _ = self.self_attn(
@@ -462,7 +525,7 @@ class TransformerDecoderLayer(nn.Module):
         tgt = self.norm1(tgt)
 
         # Cross-attention to encoder memory
-        tgt2, _ = self.multihead_attn(
+        tgt2, attn_weights = self.multihead_attn(
             query=self.with_pos_embed(tgt, query_pos),
             key=self.with_pos_embed(memory, pos),
             value=memory, attn_mask=memory_mask,
@@ -476,6 +539,8 @@ class TransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
 
+        if return_attn_weights:
+            return tgt, attn_weights
         return tgt
 
 

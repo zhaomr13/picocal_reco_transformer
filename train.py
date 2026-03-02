@@ -61,6 +61,9 @@ def get_args_parser():
     parser.add_argument('--use_focal_loss', action='store_true', help='Use focal loss for existence classification')
     parser.add_argument('--focal_gamma', default=2.0, type=float, help='Focal loss gamma parameter (higher = more focus on hard examples)')
     parser.add_argument('--focal_alpha', default=0.25, type=float, help='Focal loss alpha (balance pos/neg, 0.25 = down-weight easy negatives)')
+    parser.add_argument('--use_cell_assignment', action='store_true', help='Use cell-to-cluster assignment loss for attention supervision')
+    parser.add_argument('--cell_assignment_weight', default=0.1, type=float, help='Weight for cell assignment loss')
+    parser.add_argument('--cell_assignment_distance_threshold', default=500.0, type=float, help='Max distance (mm) for assigning cell to cluster')
 
     # Training parameters
     parser.add_argument('--lr', default=5e-5, type=float, help='Learning rate (default: 5e-5 for fine convergence)')
@@ -120,9 +123,10 @@ def train_one_epoch(model, criterion, matcher, data_loader, optimizer, device, e
                 if isinstance(t[key], torch.Tensor):
                     t[key] = t[key].to(device)
 
-        # Forward pass with auxiliary outputs if enabled
+        # Forward pass with auxiliary outputs and attention weights if enabled
         return_auxiliary = args.use_aux_losses
-        outputs = model(features, positions, mask, return_auxiliary=return_auxiliary)
+        return_attention = args.use_cell_assignment
+        outputs = model(features, positions, mask, return_auxiliary=return_auxiliary, return_attention=return_attention)
 
         # Match predictions to targets (main outputs)
         indices = matcher(outputs, targets)
@@ -215,9 +219,10 @@ def evaluate(model, criterion, matcher, data_loader, device, epoch=None, log_fil
                 if isinstance(t[key], torch.Tensor):
                     t[key] = t[key].to(device)
 
-        # Forward pass with auxiliary outputs if enabled
+        # Forward pass with auxiliary outputs and attention weights if enabled
         return_auxiliary = args.use_aux_losses if args else False
-        outputs = model(features, positions, mask, return_auxiliary=return_auxiliary)
+        return_attention = args.use_cell_assignment if args else False
+        outputs = model(features, positions, mask, return_auxiliary=return_auxiliary, return_attention=return_attention)
         indices = matcher(outputs, targets)
 
         num_clusters = sum(len(t['labels']) for t in targets)

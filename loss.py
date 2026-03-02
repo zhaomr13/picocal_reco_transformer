@@ -22,6 +22,7 @@ class PicoCalLoss(nn.Module):
 
     Supports auxiliary losses at intermediate decoder layers for improved training.
     Supports focal loss for better handling of class imbalance.
+    Supports cell-to-cluster assignment loss for better attention supervision.
     """
 
     def __init__(
@@ -39,7 +40,10 @@ class PicoCalLoss(nn.Module):
         use_aux_losses=False,
         use_focal_loss=True,  # Use focal loss instead of BCE
         focal_gamma=2.0,  # Focal loss focusing parameter
-        focal_alpha=0.25  # Focal loss alpha (balance positive/negative)
+        focal_alpha=0.25,  # Focal loss alpha (balance positive/negative)
+        use_cell_assignment=False,  # Use cell-to-cluster assignment loss
+        cell_assignment_weight=0.1,  # Weight for cell assignment loss
+        cell_assignment_distance_threshold=500.0  # Max distance for cell-cluster assignment
     ):
         """
         Args:
@@ -57,6 +61,9 @@ class PicoCalLoss(nn.Module):
             use_focal_loss: Whether to use focal loss for existence classification
             focal_gamma: Focal loss focusing parameter (higher = more focus on hard examples)
             focal_alpha: Focal loss alpha (balance between positive/negative classes)
+            use_cell_assignment: Whether to use cell-to-cluster assignment loss
+            cell_assignment_weight: Weight for cell assignment loss
+            cell_assignment_distance_threshold: Max distance (mm) for assigning cell to cluster
         """
         super().__init__()
         self.weight_existence = weight_existence
@@ -72,6 +79,9 @@ class PicoCalLoss(nn.Module):
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = focal_gamma
         self.focal_alpha = focal_alpha
+        self.use_cell_assignment = use_cell_assignment
+        self.cell_assignment_weight = cell_assignment_weight
+        self.cell_assignment_distance_threshold = cell_assignment_distance_threshold
 
         # Classification loss weighting
         self.register_buffer('empty_weight', torch.tensor([eos_coef, 1.0]))
@@ -156,13 +166,34 @@ class PicoCalLoss(nn.Module):
             losses['loss_time'] = torch.tensor(0.0, device=src_logits.device)
             losses['loss_confidence'] = torch.tensor(0.0, device=src_logits.device)
 
+        # Regression losses (only for matched predictions)
+        if len(target_energies) > 0:
+            losses['loss_energy'] = self.loss_energy(src_energies_matched, target_energies, num_clusters)
+            losses['loss_position'] = self.loss_position(src_positions_matched, target_positions, num_clusters)
+            losses['loss_time'] = self.loss_time(src_times_matched, target_times, num_clusters)
+            losses['loss_confidence'] = self.loss_confidence(src_confidence_matched, losses)
+        else:
+            losses['loss_energy'] = torch.tensor(0.0, device=src_logits.device)
+            losses['loss_position'] = torch.tensor(0.0, device=src_logits.device)
+            losses['loss_time'] = torch.tensor(0.0, device=src_logits.device)
+            losses['loss_confidence'] = torch.tensor(0.0, device=src_logits.device)
+
+        # Cell-to-cluster assignment loss (optional)
+        if self.use_cell_assignment and 'attention_weights' in outputs:
+            losses['loss_cell_assignment'] = self.loss_cell_assignment(
+                outputs, targets, indices
+            )
+        else:
+            losses['loss_cell_assignment'] = torch.tensor(0.0, device=src_logits.device)
+
         # Total loss
         total_loss = (
             self.weight_existence * losses['loss_existence'] +
             self.weight_energy * losses['loss_energy'] +
             self.weight_position * losses['loss_position'] +
             self.weight_time * losses['loss_time'] +
-            self.weight_confidence * losses['loss_confidence']
+            self.weight_confidence * losses['loss_confidence'] +
+            self.cell_assignment_weight * losses['loss_cell_assignment']
         )
 
         losses['loss_total'] = total_loss
@@ -362,6 +393,96 @@ class PicoCalLoss(nn.Module):
         loss = F.binary_cross_entropy(src_confidence, target_confidence, reduction='mean')
         return loss
 
+    def loss_cell_assignment(self, outputs, targets, indices):
+        """
+        Cell-to-cluster assignment loss.
+
+        Supervises the attention weights to match the ground truth cell-cluster assignments.
+        Each cell should attend most strongly to its nearest cluster.
+
+        Args:
+            outputs: Dict with model outputs including 'attention_weights'
+                    attention_weights: [batch_size, num_queries, num_cells]
+            targets: List of target dicts with 'positions'
+            indices: List of (pred_indices, target_indices) from Hungarian matcher
+
+        Returns:
+            Cell assignment loss (cross-entropy)
+        """
+        if 'attention_weights' not in outputs:
+            return torch.tensor(0.0, device=outputs['pred_logits'].device)
+
+        attn_weights = outputs['attention_weights']  # [B, num_queries, num_cells]
+        batch_size = attn_weights.shape[0]
+        num_queries = attn_weights.shape[1]
+        num_cells = attn_weights.shape[2]
+
+        total_loss = 0.0
+        num_valid_batches = 0
+
+        for batch_idx in range(batch_size):
+            # Get matched predictions for this batch
+            pred_idx, tgt_idx = indices[batch_idx]
+            if len(pred_idx) == 0:
+                continue
+
+            # Get cell positions from features
+            # Cell positions are in outputs['cell_positions'] or need to be passed separately
+            if 'cell_positions' not in outputs:
+                continue
+
+            cell_positions = outputs['cell_positions'][batch_idx]  # [num_cells, 2] (x, y)
+            target_positions = targets[batch_idx]['positions']  # [num_targets, 3] (x, y, z)
+
+            # Assign each cell to nearest target cluster (or "no cluster")
+            # Compute distance from each cell to each target
+            cell_xy = cell_positions[:, :2]  # [num_cells, 2]
+            tgt_xy = target_positions[:, :2]  # [num_targets, 2]
+
+            # [num_cells, num_targets]
+            distances = torch.cdist(cell_xy, tgt_xy)
+
+            # Assign cell to nearest target if within threshold
+            min_dists, nearest_tgt = distances.min(dim=1)
+
+            # Create target assignment: which query should each cell attend to?
+            # For matched predictions, map target index to query index
+            tgt_to_query = {tgt.item(): pred.item() for pred, tgt in zip(pred_idx, tgt_idx)}
+
+            # Build target tensor for cross-entropy
+            # -1 = no cluster (background), 0..num_queries-1 = query index
+            cell_targets = torch.full((num_cells,), -1, dtype=torch.long, device=attn_weights.device)
+
+            for cell_idx in range(num_cells):
+                if min_dists[cell_idx] < self.cell_assignment_distance_threshold:
+                    tgt = nearest_tgt[cell_idx].item()
+                    if tgt in tgt_to_query:
+                        query = tgt_to_query[tgt]
+                        cell_targets[cell_idx] = query
+
+            # Get attention weights for this batch
+            batch_attn = attn_weights[batch_idx]  # [num_queries, num_cells]
+
+            # Only compute loss for cells assigned to a cluster
+            valid_mask = cell_targets >= 0
+            if valid_mask.any():
+                valid_targets = cell_targets[valid_mask]
+                valid_attn = batch_attn[:, valid_mask]  # [num_queries, num_valid_cells]
+
+                # Cross-entropy: each cell should attend most to its assigned query
+                # Transpose to [num_valid_cells, num_queries] for cross-entropy
+                valid_attn_t = valid_attn.t()  # [num_valid_cells, num_queries]
+
+                # Add small epsilon for numerical stability
+                valid_attn_t = valid_attn_t + 1e-8
+                valid_attn_t = valid_attn_t / valid_attn_t.sum(dim=1, keepdim=True)
+
+                loss = F.cross_entropy(valid_attn_t, valid_targets)
+                total_loss += loss
+                num_valid_batches += 1
+
+        return total_loss / num_valid_batches if num_valid_batches > 0 else torch.tensor(0.0, device=attn_weights.device)
+
     def _get_src_permutation_idx(self, indices):
         """
         Get source (prediction) indices from matcher output.
@@ -411,6 +532,9 @@ def build_loss(args=None, **kwargs):
         'use_focal_loss': True,  # Use focal loss by default
         'focal_gamma': 2.0,
         'focal_alpha': 0.25,
+        'use_cell_assignment': False,
+        'cell_assignment_weight': 0.1,
+        'cell_assignment_distance_threshold': 500.0,
     }
 
     if args is not None:
