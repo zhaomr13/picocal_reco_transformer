@@ -55,10 +55,15 @@ def get_args_parser():
     parser.add_argument('--weight_energy', default=1.0, type=float, help='Loss weight for energy')
     parser.add_argument('--weight_position', default=1.0, type=float, help='Loss weight for position')
     parser.add_argument('--weight_time', default=0.5, type=float, help='Loss weight for time')
-    parser.add_argument('--eos_coef', default=0.1, type=float, help='Weight for no-cluster class')
+    parser.add_argument('--eos_coef', default=0.5, type=float, help='Weight for no-cluster class (0.5=balanced, was 0.1)')
+    parser.add_argument('--use_aux_losses', action='store_true', help='Use auxiliary losses at intermediate decoder layers')
+    parser.add_argument('--aux_loss_weight', default=0.5, type=float, help='Weight for auxiliary losses')
+    parser.add_argument('--use_focal_loss', action='store_true', help='Use focal loss for existence classification')
+    parser.add_argument('--focal_gamma', default=2.0, type=float, help='Focal loss gamma parameter (higher = more focus on hard examples)')
+    parser.add_argument('--focal_alpha', default=0.25, type=float, help='Focal loss alpha (balance pos/neg, 0.25 = down-weight easy negatives)')
 
     # Training parameters
-    parser.add_argument('--lr', default=1e-4, type=float, help='Learning rate')
+    parser.add_argument('--lr', default=5e-5, type=float, help='Learning rate (default: 5e-5 for fine convergence)')
     parser.add_argument('--weight_decay', default=1e-4, type=float, help='Weight decay')
     parser.add_argument('--batch_size', default=4, type=int, help='Batch size')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs')
@@ -115,18 +120,35 @@ def train_one_epoch(model, criterion, matcher, data_loader, optimizer, device, e
                 if isinstance(t[key], torch.Tensor):
                     t[key] = t[key].to(device)
 
-        # Forward pass
-        outputs = model(features, positions, mask)
+        # Forward pass with auxiliary outputs if enabled
+        return_auxiliary = args.use_aux_losses
+        outputs = model(features, positions, mask, return_auxiliary=return_auxiliary)
 
-        # Match predictions to targets
+        # Match predictions to targets (main outputs)
         indices = matcher(outputs, targets)
 
-        # Compute loss
+        # Compute main loss
         num_clusters = sum(len(t['labels']) for t in targets)
         num_clusters = torch.as_tensor([num_clusters], dtype=torch.float32, device=device)
 
         loss_dict = criterion(outputs, targets, indices, num_clusters)
         loss = loss_dict['loss_total']
+
+        # Compute auxiliary losses if enabled
+        if args.use_aux_losses and 'aux_outputs' in outputs:
+            # Match and compute loss for each auxiliary output
+            aux_indices_list = [matcher(aux_out, targets) for aux_out in outputs['aux_outputs']]
+            outputs_list = outputs['aux_outputs'] + [outputs]  # All outputs including final
+            indices_list = aux_indices_list + [indices]
+
+            aux_losses = criterion.compute_aux_losses(outputs_list, targets, indices_list, num_clusters)
+
+            # Add auxiliary losses to total loss
+            if 'loss_aux_total' in aux_losses:
+                loss = loss + aux_losses['loss_aux_total']
+
+            # Merge auxiliary losses into loss_dict for logging
+            loss_dict.update(aux_losses)
 
         # Backward pass
         optimizer.zero_grad()
@@ -174,7 +196,7 @@ def train_one_epoch(model, criterion, matcher, data_loader, optimizer, device, e
 
 
 @torch.no_grad()
-def evaluate(model, criterion, matcher, data_loader, device, epoch=None, log_file=None):
+def evaluate(model, criterion, matcher, data_loader, device, epoch=None, log_file=None, args=None):
     """Evaluate on validation set."""
     model.eval()
     criterion.eval()
@@ -193,7 +215,9 @@ def evaluate(model, criterion, matcher, data_loader, device, epoch=None, log_fil
                 if isinstance(t[key], torch.Tensor):
                     t[key] = t[key].to(device)
 
-        outputs = model(features, positions, mask)
+        # Forward pass with auxiliary outputs if enabled
+        return_auxiliary = args.use_aux_losses if args else False
+        outputs = model(features, positions, mask, return_auxiliary=return_auxiliary)
         indices = matcher(outputs, targets)
 
         num_clusters = sum(len(t['labels']) for t in targets)
@@ -201,6 +225,17 @@ def evaluate(model, criterion, matcher, data_loader, device, epoch=None, log_fil
 
         loss_dict = criterion(outputs, targets, indices, num_clusters)
         loss = loss_dict['loss_total']
+
+        # Compute auxiliary losses if enabled (for monitoring)
+        if return_auxiliary and 'aux_outputs' in outputs:
+            aux_indices_list = [matcher(aux_out, targets) for aux_out in outputs['aux_outputs']]
+            outputs_list = outputs['aux_outputs'] + [outputs]
+            indices_list = aux_indices_list + [indices]
+
+            aux_losses = criterion.compute_aux_losses(outputs_list, targets, indices_list, num_clusters)
+            loss_dict.update(aux_losses)
+            if 'loss_aux_total' in aux_losses:
+                loss = loss + aux_losses['loss_aux_total']
 
         total_loss += loss.item()
         for key, val in loss_dict.items():
@@ -374,7 +409,7 @@ def main(args):
 
         # Evaluate
         if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
-            val_loss, val_loss_dict = evaluate(model, criterion, matcher, val_loader, device, epoch, log_file)
+            val_loss, val_loss_dict = evaluate(model, criterion, matcher, val_loader, device, epoch, log_file, args)
 
             # Save best model
             if val_loss < best_val_loss:

@@ -126,7 +126,7 @@ class PicoCalTransformerModel(nn.Module):
         print(f"Initialized position head for anchor-based prediction")
         print(f"Query anchors initialized with std: {self.query_anchors.data.std():.2f} mm")
 
-    def forward(self, cell_features, cell_positions, mask=None):
+    def forward(self, cell_features, cell_positions, mask=None, return_auxiliary=False):
         """
         Forward pass.
 
@@ -134,6 +134,7 @@ class PicoCalTransformerModel(nn.Module):
             cell_features: [batch_size, num_cells, n_features] tensor of cell features
             cell_positions: [batch_size, num_cells, 2] tensor of (x, y) positions
             mask: Optional [batch_size, num_cells] bool tensor (True for padded cells)
+            return_auxiliary: If True, return predictions from all decoder layers
 
         Returns:
             Dictionary with:
@@ -141,6 +142,8 @@ class PicoCalTransformerModel(nn.Module):
             - pred_energies: [batch_size, num_queries, 3] (E, E_F, E_B) energies
             - pred_positions: [batch_size, num_queries, 3] (x, y, z) positions
             - pred_times: [batch_size, num_queries, 3] (t, t_F, t_B) times
+            - pred_confidence: [batch_size, num_queries] confidence scores
+            - aux_outputs: List of prediction dicts from intermediate layers (if return_auxiliary=True)
         """
         batch_size, num_cells, _ = cell_features.shape
 
@@ -175,15 +178,26 @@ class PicoCalTransformerModel(nn.Module):
             query_pos=query_embed
         )  # [num_layers, num_queries, B, d_model] or [1, num_queries, B, d_model]
 
-        # Take final decoder output: [batch_size, num_queries, d_model]
+        # Take decoder outputs
         if self.decoder.return_intermediate:
-            # Use the last layer's output
-            output_embeddings = hs[-1].transpose(0, 1)
+            # hs has shape [num_layers, num_queries, B, d_model]
+            # Convert to list of [batch_size, num_queries, d_model]
+            output_embeddings_list = [h.transpose(0, 1) for h in hs]
         else:
-            output_embeddings = hs.transpose(0, 1)
+            output_embeddings_list = [hs.transpose(0, 1)]
 
-        # Apply prediction heads (with query anchors for position prediction)
-        predictions = self.cluster_head(output_embeddings, self.query_anchors)
+        # Apply prediction heads to all layers
+        all_predictions = [
+            self.cluster_head(emb, self.query_anchors)
+            for emb in output_embeddings_list
+        ]
+
+        # The final prediction is from the last layer
+        predictions = all_predictions[-1]
+
+        # Add auxiliary outputs if requested
+        if return_auxiliary and len(all_predictions) > 1:
+            predictions['aux_outputs'] = all_predictions[:-1]
 
         return predictions
 

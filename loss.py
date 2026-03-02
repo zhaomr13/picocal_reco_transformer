@@ -19,6 +19,9 @@ class PicoCalLoss(nn.Module):
 
     The loss is computed after Hungarian matching to assign predictions to targets.
     Unmatched predictions are penalized for predicting a cluster where none exists.
+
+    Supports auxiliary losses at intermediate decoder layers for improved training.
+    Supports focal loss for better handling of class imbalance.
     """
 
     def __init__(
@@ -31,7 +34,12 @@ class PicoCalLoss(nn.Module):
         energy_loss_type='huber',
         position_loss_type='l1',
         time_loss_type='l1',
-        eos_coef=0.1  # Weight for "no cluster" class in classification loss
+        eos_coef=0.5,  # Weight for "no cluster" class (was 0.1, now balanced)
+        aux_loss_weight=0.5,  # Weight for auxiliary losses at intermediate layers
+        use_aux_losses=False,
+        use_focal_loss=True,  # Use focal loss instead of BCE
+        focal_gamma=2.0,  # Focal loss focusing parameter
+        focal_alpha=0.25  # Focal loss alpha (balance positive/negative)
     ):
         """
         Args:
@@ -44,6 +52,11 @@ class PicoCalLoss(nn.Module):
             position_loss_type: Type of position loss ('l1', 'l2')
             time_loss_type: Type of time loss ('l1', 'l2')
             eos_coef: Weight for no-cluster class in classification
+            aux_loss_weight: Weight multiplier for auxiliary losses (typically 0.5)
+            use_aux_losses: Whether to compute auxiliary losses at intermediate layers
+            use_focal_loss: Whether to use focal loss for existence classification
+            focal_gamma: Focal loss focusing parameter (higher = more focus on hard examples)
+            focal_alpha: Focal loss alpha (balance between positive/negative classes)
         """
         super().__init__()
         self.weight_existence = weight_existence
@@ -54,6 +67,11 @@ class PicoCalLoss(nn.Module):
         self.energy_loss_type = energy_loss_type
         self.position_loss_type = position_loss_type
         self.time_loss_type = time_loss_type
+        self.aux_loss_weight = aux_loss_weight
+        self.use_aux_losses = use_aux_losses
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
 
         # Classification loss weighting
         self.register_buffer('empty_weight', torch.tensor([eos_coef, 1.0]))
@@ -151,6 +169,38 @@ class PicoCalLoss(nn.Module):
 
         return losses
 
+    def compute_aux_losses(self, outputs_list, targets, indices_list, num_clusters):
+        """
+        Compute auxiliary losses at intermediate decoder layers.
+
+        Args:
+            outputs_list: List of output dicts from each decoder layer
+            targets: List of target dicts (one per batch element)
+            indices_list: List of (pred_indices, target_indices) tuples for each layer
+            num_clusters: Total number of target clusters in batch
+
+        Returns:
+            Dict of auxiliary losses with 'aux_' prefix
+        """
+        if not self.use_aux_losses or len(outputs_list) <= 1:
+            return {}
+
+        aux_losses = {}
+
+        # Compute losses for each intermediate layer (all except the last which is the main loss)
+        for i, (outputs, indices) in enumerate(zip(outputs_list[:-1], indices_list[:-1])):
+            layer_losses = self.forward(outputs, targets, indices, num_clusters)
+
+            # Prefix with aux_{layer}_ and scale by aux_loss_weight
+            for key, val in layer_losses.items():
+                aux_key = f'aux_{i}_{key}'
+                aux_losses[aux_key] = val * self.aux_loss_weight
+
+        # Also compute total auxiliary loss for convenience
+        aux_losses['loss_aux_total'] = sum(aux_losses.values())
+
+        return aux_losses
+
     def loss_existence(self, src_logits, target_classes):
         """
         Binary classification loss for cluster existence.
@@ -163,15 +213,45 @@ class PicoCalLoss(nn.Module):
             Classification loss
         """
         # Reshape for cross-entropy
-        src_logits_flat = src_logits.view(-1, 1)  # [B*Q, 1]
-        target_classes_flat = target_classes.view(-1)  # [B*Q]
+        src_logits_flat = src_logits.view(-1)  # [B*Q]
+        target_classes_flat = target_classes.view(-1).float()  # [B*Q]
 
-        # Binary cross-entropy with weighting for negative class
-        loss = F.binary_cross_entropy_with_logits(
-            src_logits_flat.squeeze(-1).float(),
-            target_classes_flat.float(),
-            pos_weight=self.empty_weight[1] / self.empty_weight[0]
-        )
+        if self.use_focal_loss:
+            # Focal Loss: FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
+            # This down-weights easy examples and focuses on hard examples
+            probs = torch.sigmoid(src_logits_flat)
+
+            # Compute p_t: probability of the true class
+            # For positive class (y=1): p_t = p
+            # For negative class (y=0): p_t = 1 - p
+            p_t = probs * target_classes_flat + (1 - probs) * (1 - target_classes_flat)
+
+            # Compute alpha_t: class weighting
+            # For positive class: alpha_t = alpha
+            # For negative class: alpha_t = 1 - alpha
+            alpha_t = self.focal_alpha * target_classes_flat + (1 - self.focal_alpha) * (1 - target_classes_flat)
+
+            # Compute BCE loss
+            bce_loss = F.binary_cross_entropy_with_logits(
+                src_logits_flat, target_classes_flat, reduction='none'
+            )
+
+            # Apply focal weighting: (1 - p_t)^gamma
+            focal_weight = (1 - p_t) ** self.focal_gamma
+
+            # Combine
+            loss = (alpha_t * focal_weight * bce_loss).mean()
+        else:
+            # Standard BCE with class weighting
+            # Apply class weights: higher weight for underrepresented class
+            weights = target_classes_flat * self.empty_weight[1] + (1 - target_classes_flat) * self.empty_weight[0]
+
+            loss = F.binary_cross_entropy_with_logits(
+                src_logits_flat,
+                target_classes_flat,
+                weight=weights,
+                reduction='mean'
+            )
 
         return loss
 
@@ -325,7 +405,12 @@ def build_loss(args=None, **kwargs):
         'energy_loss_type': 'huber',
         'position_loss_type': 'l1',
         'time_loss_type': 'l1',
-        'eos_coef': 0.1,
+        'eos_coef': 0.5,  # Balanced class weighting (was 0.1)
+        'aux_loss_weight': 0.5,
+        'use_aux_losses': False,
+        'use_focal_loss': True,  # Use focal loss by default
+        'focal_gamma': 2.0,
+        'focal_alpha': 0.25,
     }
 
     if args is not None:
