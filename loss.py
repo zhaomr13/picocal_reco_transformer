@@ -38,7 +38,7 @@ class PicoCalLoss(nn.Module):
         eos_coef=0.5,  # Weight for "no cluster" class (was 0.1, now balanced)
         aux_loss_weight=0.5,  # Weight for auxiliary losses at intermediate layers
         use_aux_losses=False,
-        use_focal_loss=True,  # Use focal loss instead of BCE
+        use_focal_loss=False,  # Use standard cross-entropy like original DETR
         focal_gamma=2.0,  # Focal loss focusing parameter
         focal_alpha=0.25,  # Focal loss alpha (balance positive/negative)
         use_cell_assignment=False,  # Use cell-to-cluster assignment loss
@@ -529,7 +529,7 @@ def build_loss(args=None, **kwargs):
         'eos_coef': 0.5,  # Balanced class weighting (was 0.1)
         'aux_loss_weight': 0.5,
         'use_aux_losses': False,
-        'use_focal_loss': True,  # Use focal loss by default
+        'use_focal_loss': False,  # Use standard cross-entropy like original DETR
         'focal_gamma': 2.0,
         'focal_alpha': 0.25,
         'use_cell_assignment': False,
