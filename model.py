@@ -86,8 +86,11 @@ class PicoCalTransformerModel(nn.Module):
 
         # Query anchor positions - learnable "home" positions for each query
         # Initialize spread across the calorimeter (X: -3000 to 3000, Y: -2000 to 2000)
+        # Scale std by data range to ensure equal coverage: X_range/Y_range = 6000/4000 = 1.5
+        anchor_std_x = 2250.0  # 1.5 * 1500
+        anchor_std_y = 1500.0
         self.query_anchors = nn.Parameter(
-            torch.randn(num_cluster_queries, 2) * 1500.0
+            torch.randn(num_cluster_queries, 2) * torch.tensor([anchor_std_x, anchor_std_y])
         )
 
         # Prediction heads
@@ -121,10 +124,16 @@ class PicoCalTransformerModel(nn.Module):
         position_head_last.bias.data[2] = 12620.0
 
         # Re-initialize query anchors with proper spread (xavier overwrites them)
-        nn.init.normal_(self.query_anchors, mean=0.0, std=1500.0)
+        # Use separate std for X and Y to match data ranges (6000mm vs 4000mm)
+        anchor_std_x = 2250.0  # 1.5 * 1500
+        anchor_std_y = 1500.0
+        with torch.no_grad():
+            self.query_anchors[:, 0].normal_(mean=0.0, std=anchor_std_x)
+            self.query_anchors[:, 1].normal_(mean=0.0, std=anchor_std_y)
 
         print(f"Initialized position head for anchor-based prediction")
-        print(f"Query anchors initialized with std: {self.query_anchors.data.std():.2f} mm")
+        print(f"Query anchors X: std={self.query_anchors[:, 0].std():.2f} mm")
+        print(f"Query anchors Y: std={self.query_anchors[:, 1].std():.2f} mm")
 
     def forward(self, cell_features, cell_positions, mask=None, return_auxiliary=False, return_attention=False):
         """
@@ -318,8 +327,8 @@ class ClusterPredictionHead(nn.Module):
         pred_times = self.time_head(shared)  # [B, num_queries, 3]
         pred_confidence = self.confidence_head(shared).squeeze(-1)  # [B, num_queries]
 
-        # Apply log-transform to energies (predict log(E + 1) to handle wide dynamic range)
-        pred_energies = F.softplus(pred_energies)  # Ensure positive energies
+        # Ensure positive energies using softplus (smooth, stable)
+        pred_energies = F.softplus(pred_energies)  # log(1 + exp(x)), grows linearly for large x
 
         # Compute final positions: anchor + offset
         if query_anchors is not None:

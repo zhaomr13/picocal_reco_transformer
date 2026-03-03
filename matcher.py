@@ -28,19 +28,24 @@ class HungarianMatcher(nn.Module):
     - Time cost: L1 distance between predicted and target times
     """
 
-    def __init__(self, cost_existence=1.0, cost_energy=1.0, cost_position=1.0, cost_time=0.5):
+    def __init__(self, cost_existence=1.0, cost_energy=1.0, cost_position=1.0, cost_time=0.5,
+                 existence_threshold=0.25, position_scale=4000.0):
         """
         Args:
             cost_existence: Weight for classification (cluster existence) cost
             cost_energy: Weight for energy matching cost
-            cost_position: Weight for position matching cost
+            cost_position: Weight for position matching cost (should match training weight)
             cost_time: Weight for time matching cost
+            existence_threshold: Threshold for considering a prediction as positive
+            position_scale: Scale for position cost normalization (mm)
         """
         super().__init__()
         self.cost_existence = cost_existence
         self.cost_energy = cost_energy
         self.cost_position = cost_position
         self.cost_time = cost_time
+        self.existence_threshold = existence_threshold
+        self.position_scale = position_scale
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -93,8 +98,7 @@ class HungarianMatcher(nn.Module):
 
         # Compute position cost (L2 distance)
         # Normalize by typical calorimeter scale (~4000 mm)
-        position_scale = 4000.0
-        cost_position = torch.cdist(out_positions, tgt_positions, p=2) / position_scale  # [B*Q, total_targets]
+        cost_position = torch.cdist(out_positions, tgt_positions, p=2) / self.position_scale  # [B*Q, total_targets]
 
         # Compute time cost (L1 distance)
         # Normalize by typical timing resolution (~1 ns)
@@ -156,6 +160,7 @@ def build_matcher(args=None, **kwargs):
         'cost_energy': 1.0,
         'cost_position': 1.0,
         'cost_time': 0.5,
+        'position_scale': 4000.0,
     }
 
     if args is not None:

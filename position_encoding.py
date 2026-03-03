@@ -51,9 +51,11 @@ class PositionEncodingSine(nn.Module):
 
         # Normalize coordinates if requested
         if self.normalize:
-            # Normalize to [0, scale] based on calorimeter dimensions (~+/-4000mm)
-            x = (x + 4000) / 8000 * self.scale
-            y = (y + 4000) / 8000 * self.scale
+            # Normalize to [0, scale] based on actual calorimeter dimensions
+            # X: -3000 to 3000 (6000mm span), Y: -2000 to 2000 (4000mm span)
+            # This ensures equal encoding utilization for both axes
+            x = (x + 3000) / 6000 * self.scale
+            y = (y + 2000) / 4000 * self.scale
             # Clamp to valid range
             x = torch.clamp(x, 0, self.scale)
             y = torch.clamp(y, 0, self.scale)

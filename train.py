@@ -64,6 +64,7 @@ def get_args_parser():
     parser.add_argument('--use_cell_assignment', action='store_true', help='Use cell-to-cluster assignment loss for attention supervision')
     parser.add_argument('--cell_assignment_weight', default=0.1, type=float, help='Weight for cell assignment loss')
     parser.add_argument('--cell_assignment_distance_threshold', default=500.0, type=float, help='Max distance (mm) for assigning cell to cluster')
+    parser.add_argument('--position_scale', default=4000.0, type=float, help='Scale for position loss normalization (mm)')
 
     # Training parameters
     parser.add_argument('--lr', default=5e-5, type=float, help='Learning rate (default: 5e-5 for fine convergence)')

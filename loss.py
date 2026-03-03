@@ -41,9 +41,10 @@ class PicoCalLoss(nn.Module):
         use_focal_loss=False,  # Use standard cross-entropy like original DETR
         focal_gamma=2.0,  # Focal loss focusing parameter
         focal_alpha=0.25,  # Focal loss alpha (balance positive/negative)
-        use_cell_assignment=False,  # Use cell-to-cluster assignment loss
-        cell_assignment_weight=0.1,  # Weight for cell assignment loss
-        cell_assignment_distance_threshold=500.0  # Max distance for cell-cluster assignment
+        use_cell_assignment=False,  # DISABLED: cell-to-cluster assignment loss not learning
+        cell_assignment_weight=0.0,  # Set to 0 to disable
+        cell_assignment_distance_threshold=500.0,  # Max distance for cell-cluster assignment
+        position_scale=4000.0  # Scale for position loss normalization (mm)
     ):
         """
         Args:
@@ -82,6 +83,7 @@ class PicoCalLoss(nn.Module):
         self.use_cell_assignment = use_cell_assignment
         self.cell_assignment_weight = cell_assignment_weight
         self.cell_assignment_distance_threshold = cell_assignment_distance_threshold
+        self.position_scale = position_scale
 
         # Classification loss weighting
         self.register_buffer('empty_weight', torch.tensor([eos_coef, 1.0]))
@@ -153,18 +155,6 @@ class PicoCalLoss(nn.Module):
 
         # Classification loss (existence)
         losses['loss_existence'] = self.loss_existence(src_logits, target_classes)
-
-        # Regression losses (only for matched predictions)
-        if len(target_energies) > 0:
-            losses['loss_energy'] = self.loss_energy(src_energies_matched, target_energies, num_clusters)
-            losses['loss_position'] = self.loss_position(src_positions_matched, target_positions, num_clusters)
-            losses['loss_time'] = self.loss_time(src_times_matched, target_times, num_clusters)
-            losses['loss_confidence'] = self.loss_confidence(src_confidence_matched, losses)
-        else:
-            losses['loss_energy'] = torch.tensor(0.0, device=src_logits.device)
-            losses['loss_position'] = torch.tensor(0.0, device=src_logits.device)
-            losses['loss_time'] = torch.tensor(0.0, device=src_logits.device)
-            losses['loss_confidence'] = torch.tensor(0.0, device=src_logits.device)
 
         # Regression losses (only for matched predictions)
         if len(target_energies) > 0:
@@ -293,7 +283,7 @@ class PicoCalLoss(nn.Module):
         Uses log-transform for better dynamic range handling.
 
         Args:
-            src_energies: [num_matched, 3] predicted energies
+            src_energies: [num_matched, 3] predicted energies (softplus output, always positive)
             target_energies: [num_matched, 3] target energies
             num_clusters: total number of clusters for normalization
 
@@ -327,18 +317,22 @@ class PicoCalLoss(nn.Module):
             num_clusters: total number of clusters for normalization
 
         Returns:
-            Position loss
+            Position loss (normalized, unitless)
         """
-        # Normalize by calorimeter scale (~4000 mm)
-        scale = 4000.0
+        # Normalize by calorimeter scale (~4000mm) to keep loss unitless and comparable
+        # Position loss ~0.05 for 200mm error → 0.25 with weight=5.0 (matches other losses)
+        scale = self.position_scale
 
         if self.position_loss_type == 'l1':
+            # L1 loss per coordinate, averaged over clusters
             loss = F.l1_loss(src_positions / scale, target_positions / scale, reduction='sum')
         elif self.position_loss_type == 'l2':
+            # L2 loss per coordinate, averaged over clusters
             loss = F.mse_loss(src_positions / scale, target_positions / scale, reduction='sum')
         else:
             raise ValueError(f"Unknown position loss type: {self.position_loss_type}")
 
+        # Average over matched clusters (reduction='sum' gives total, so divide by count)
         return loss / num_clusters if num_clusters > 0 else loss
 
     def loss_time(self, src_times, target_times, num_clusters):
@@ -533,8 +527,9 @@ def build_loss(args=None, **kwargs):
         'focal_gamma': 2.0,
         'focal_alpha': 0.25,
         'use_cell_assignment': False,
-        'cell_assignment_weight': 0.1,
+        'cell_assignment_weight': 0.0,
         'cell_assignment_distance_threshold': 500.0,
+        'position_scale': 4000.0,
     }
 
     if args is not None:
